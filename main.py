@@ -1,5 +1,5 @@
 """
-智能群聊上下文增强插件 v2.1 (安全加固版)
+智能群聊上下文增强插件 v2.1 (安全加固与兼容性修复版)
 """
 import traceback
 import json
@@ -23,7 +23,8 @@ from astrbot.api.event import filter as event_filter, AstrMessageEvent, MessageE
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.message_components import Plain, At, Image, Face, Reply, MessageComponent
+# --- 兼容性修正：移除了不存在的 MessageComponent 导入 ---
+from astrbot.api.message_components import Plain, At, Image, Face, Reply
 from astrbot.api.platform import MessageType
 
 # 导入工具模块
@@ -63,7 +64,6 @@ class PluginConfig:
     duplicate_check_time_seconds: int
     passive_reply_instruction: str
     active_speech_instruction: str
-    # --- 新增：主动回复配置 ---
     enable_active_reply: bool
     active_reply_delay: int
     active_reply_min_messages: int
@@ -139,7 +139,7 @@ class GroupMessage:
         instance.has_image = len(instance.images) > 0
         return instance
 
-@register("context_enhancer_v2", "木有知", "智能群聊上下文增强插件 v2.1", "2.1.0", repo="https://github.com/muyouzhi6/astrbot_plugin_context_enhancer")
+@register("context_enhancer_v2", "木有知", "智能群聊上下文增强插件 v2.1", "2.1.1", repo="https://github.com/muyouzhi6/astrbot_plugin_context_enhancer")
 class ContextEnhancerV2(Star):
     CACHE_LOAD_BUFFER_MULTIPLIER = 2
 
@@ -209,7 +209,6 @@ class ContextEnhancerV2(Star):
             duplicate_check_time_seconds=self.raw_config.get("duplicate_check_time_seconds", 30),
             passive_reply_instruction=self.raw_config.get("passive_reply_instruction", '现在，群成员 {sender_name} (ID: {sender_id}) 正在对你说话，TA说："{original_prompt}"'),
             active_speech_instruction=self.raw_config.get("active_speech_instruction", '以上是最近的聊天记录。你决定主动参与讨论，并想就以下内容发表你的看法："{original_prompt}"'),
-            # --- 新增：主动回复配置 ---
             enable_active_reply=self.raw_config.get("enable_active_reply", False),
             active_reply_delay=self.raw_config.get("active_reply_delay", 120),
             active_reply_min_messages=self.raw_config.get("active_reply_min_messages", 10),
@@ -367,7 +366,6 @@ class ContextEnhancerV2(Star):
             target_deque = buffers.bot_replies if message_type == ContextMessageType.BOT_REPLY else buffers.recent_chats
             if not self._is_duplicate_message(target_deque, group_msg):
                 target_deque.append(group_msg)
-        # --- 新增：调度主动回复 ---
         self._schedule_active_reply(event)
 
     def _is_duplicate_message(self, target_deque: deque, new_msg: GroupMessage) -> bool:
@@ -520,21 +518,12 @@ class ContextEnhancerV2(Star):
         group_id = event.get_group_id()
         if group_id: await self.clear_context_cache(group_id=group_id)
 
-    # --- 新增：主动回复的核心逻辑 ---
     def _schedule_active_reply(self, event: AstrMessageEvent):
-        """调度或重置主动回复的计时器"""
-        if not self.config.enable_active_reply:
-            return
-
+        if not self.config.enable_active_reply: return
         group_id = event.get_group_id()
-        if not group_id:
-            return
-
-        # 如果已有计时器，先取消
+        if not group_id: return
         if group_id in self.active_reply_timers:
             self.active_reply_timers[group_id].cancel()
-
-        # 创建一个新的计时器
         loop = asyncio.get_event_loop()
         self.active_reply_timers[group_id] = loop.call_later(
             self.config.active_reply_delay,
@@ -542,25 +531,17 @@ class ContextEnhancerV2(Star):
         )
 
     async def _check_and_trigger_active_reply(self, event: AstrMessageEvent, group_id: str):
-        """检查条件并决定是否触发主动回复"""
         if random.random() > self.config.active_reply_probability:
-            logger.debug(f"群 {group_id} 未通过主动回复概率检查，跳过。")
             return
-        
         await self._perform_active_reply(event, group_id)
 
     async def _perform_active_reply(self, event: AstrMessageEvent, group_id: str):
-        """执行主动回复，并在发送前手动通过结果装饰流水线进行清理"""
         async with self._get_or_create_lock(group_id):
-            # 检查并移除计时器，防止重复触发
             if group_id in self.active_reply_timers:
                 del self.active_reply_timers[group_id]
             else:
-                return # 如果计时器已被其他操作取消，则不执行
-
+                return
             logger.info(f"[ContextEnhancerV2] 在群 {group_id} 触发主动回复。")
-
-            # 1. 准备上下文和 Prompt
             persona_id = self.config.active_reply_persona
             persona = None
             if persona_id:
@@ -568,66 +549,41 @@ class ContextEnhancerV2(Star):
                     persona = await self.context.persona_manager.get_persona(persona_id)
                 except Exception as e:
                     logger.warning(f"获取主动回复人格 {persona_id} 失败: {e}")
-
             buffers = await self._get_or_create_group_buffers(group_id)
             all_messages = list(heapq.merge(
                 buffers.recent_chats, buffers.bot_replies, key=lambda x: x.timestamp
             ))
-            
-            # 筛选在时间窗口内的消息
             time_window = datetime.timedelta(seconds=self.config.active_reply_context_ttl)
             now = datetime.datetime.now()
             context_messages = [msg for msg in all_messages if now - msg.timestamp < time_window]
-            
             if len(context_messages) < self.config.active_reply_min_messages:
-                logger.debug(f"群 {group_id} 近期消息不足 ({len(context_messages)}/{self.config.active_reply_min_messages})，取消主动回复。")
                 return
-
             formatted_context = "\n".join([f"{msg.sender_name}: {msg.text_content}" for msg in context_messages])
             prompt = self.config.active_reply_prompt.replace("{context}", formatted_context)
-
-            # 2. 调用 LLM 获取原始回复
             try:
                 provider = self.context.get_using_provider()
                 if not provider: return
-
                 kwargs = {"prompt": prompt}
                 if persona and persona.system_prompt:
                     kwargs["system_prompt"] = persona.system_prompt
-
                 resp = await provider.text_chat(**kwargs)
-
                 if resp and resp.completion_text:
-                    logger.debug(f"主动回复原始文本: {resp.completion_text[:100]}...")
-
-                    # 3. 创建一个临时的结果对象
                     active_result = MessageEventResult()
                     active_result.message(resp.completion_text)
-
-                    # 4. 创建一个临时的“事件”对象来承载这个结果
                     synthetic_event = AstrMessageEvent(
                         platform=event.platform, adapter=event.adapter,
                         message_str="", message_obj=event.message_obj,
                         astrbot=self.context.astrbot,
                     )
                     synthetic_event.set_result(active_result)
-
-                    # 5. 手动调用“结果装饰”流水线进行“安检”
                     try:
                         pipeline_manager = self.context.astrbot.pipeline_manager
                         decorate_stage = pipeline_manager.get_stage("result_decorate")
                         if decorate_stage:
                             await decorate_stage.process(synthetic_event)
-                            logger.debug("主动回复已成功通过结果装饰流水线。")
-                        else:
-                            logger.warning("[ContextEnhancerV2] 无法找到 'result_decorate' 流水线。")
                     except Exception as e:
                         logger.error(f"[ContextEnhancerV2] 手动处理主动回复时发生错误: {e}", exc_info=True)
-
-                    # 6. 从被处理过的结果中，提取干净的消息链
                     cleaned_message_chain = active_result.chain
-
-                    # 7. 使用底层API发送“干净的消息”
                     if cleaned_message_chain:
                         await self.context.send_message(
                             message=cleaned_message_chain,

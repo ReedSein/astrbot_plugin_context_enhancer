@@ -1,5 +1,5 @@
 """
-智能群聊上下文增强插件 v2.2 (架构重构/并发安全最终版)
+智能群聊上下文增强插件 v2.3 (最终兼容与安全版)
 """
 import traceback
 import json
@@ -26,7 +26,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.message_components import Plain, At, Image, Face, Reply
 from astrbot.api.platform import MessageType
 
-# --- 新增：内部事件通信的特殊前缀 ---
+# --- 内部事件通信的特殊前缀 ---
 INTERNAL_REPLY_PREFIX = "___INTERNAL_ACTIVE_REPLY___:::"
 
 # 导入工具模块
@@ -141,7 +141,7 @@ class GroupMessage:
         instance.has_image = len(instance.images) > 0
         return instance
 
-@register("context_enhancer_v2", "木有知", "智能群聊上下文增强插件 v2.2", "2.2.0", repo="https://github.com/muyouzhi6/astrbot_plugin_context_enhancer")
+@register("context_enhancer_v2", "木有知", "智能群聊上下文增强插件 v2.3", "2.3.0", repo="https://github.com/muyouzhi6/astrbot_plugin_context_enhancer")
 class ContextEnhancerV2(Star):
     CACHE_LOAD_BUFFER_MULTIPLIER = 2
 
@@ -150,7 +150,7 @@ class ContextEnhancerV2(Star):
         self.raw_config = config
         self.config = self._load_plugin_config()
         self._global_lock = asyncio.Lock()
-        logger.info("[ContextEnhancerV2] 上下文增强器v2.2已初始化")
+        logger.info("[ContextEnhancerV2] 上下文增强器v2.3已初始化")
         self._initialize_utils()
         self.group_messages: Dict[str, "GroupMessageBuffers"] = {}
         self.group_locks: defaultdict[str, Lock] = defaultdict(Lock)
@@ -296,43 +296,29 @@ class ContextEnhancerV2(Star):
         group_id = event.get_group_id()
         return not self.config.enabled_groups or group_id in self.config.enabled_groups
 
-    # --- 架构重构：新增 on_message 钩子，专门处理内部事件 ---
-    @event_filter.on_message(priority=0) # 最高优先级，确保最先运行
-    async def on_internal_message(self, event: AstrMessageEvent):
-        """拦截并处理由本插件生成的主动回复内部事件"""
-        # 仅处理机器人自己发出的、带有特殊前缀的消息
-        if not self._is_bot_message(event):
-            return
-        
-        msg_text = event.get_plain_text()
-        if msg_text.startswith(INTERNAL_REPLY_PREFIX):
+    @event_filter.platform_adapter_type(event_filter.PlatformAdapterType.ALL, priority=0)
+    async def on_message(self, event: AstrMessageEvent):
+        # --- 架构重构：合并内部事件处理与常规消息处理 ---
+        # 1. 首先检查是否是我们的内部事件
+        if self._is_bot_message(event) and event.get_plain_text().startswith(INTERNAL_REPLY_PREFIX):
             logger.debug("[ContextEnhancerV2] 捕获到主动回复内部事件。")
-            # 阻止这条内部消息本身被发送出去
             event.stop_propagation()
             event.stop_event()
-            
-            # 提取真正的回复内容
-            payload = msg_text.replace(INTERNAL_REPLY_PREFIX, "", 1)
-            
-            # 用标准方法设置结果，将其安全地送入标准流水线
+            payload = event.get_plain_text().replace(INTERNAL_REPLY_PREFIX, "", 1)
             result = MessageEventResult()
             result.message(payload)
             event.set_result(result)
-            
             logger.debug("[ContextEnhancerV2] 内部事件已转换为标准结果，送入流水线处理。")
+            return # 处理完毕，直接返回
 
-    @event_filter.platform_adapter_type(event_filter.PlatformAdapterType.ALL)
-    async def on_message(self, event: AstrMessageEvent):
+        # 2. 如果不是内部事件，再执行常规的消息收集逻辑
         if not self.is_chat_enabled(event): return
         
-        # --- 架构重构：确保内部事件不会被重复处理 ---
-        if event.get_plain_text().startswith(INTERNAL_REPLY_PREFIX) and self._is_bot_message(event):
-            return
-
         message_text = (event.message_str or "").strip()
         if message_text.lower() in ["reset", "new"]:
             await self.handle_clear_context_command(event)
             return
+            
         if event.get_message_type() == MessageType.GROUP_MESSAGE:
             await self._handle_group_message(event)
 
@@ -572,7 +558,6 @@ class ContextEnhancerV2(Star):
             if group_id not in self.active_reply_timers:
                 return
             del self.active_reply_timers[group_id]
-
         logger.info(f"[ContextEnhancerV2] 在群 {group_id} 触发主动回复检查。")
         persona_id = self.config.active_reply_persona
         persona = None
@@ -590,7 +575,6 @@ class ContextEnhancerV2(Star):
             return
         formatted_context = "\n".join([f"{msg.sender_name}: {msg.text_content}" for msg in context_messages])
         prompt = self.config.active_reply_prompt.replace("{context}", formatted_context)
-
         try:
             provider = self.context.get_using_provider()
             if not provider: return
@@ -609,6 +593,5 @@ class ContextEnhancerV2(Star):
                     target_type="group",
                     platform=event.get_platform_name(),
                 )
-
         except Exception as e:
             logger.error(f"执行主动回复时发生严重错误: {e}", exc_info=True)

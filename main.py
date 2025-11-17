@@ -474,12 +474,77 @@ class ContextEnhancerV2(Star):
         return f"{context_str}\n\n{instruction_prompt}", image_urls
 
     def _inject_context_into_request(self, request: ProviderRequest, context_enhancement: str, image_urls: list[str]):
-        if context_enhancement:
+    """注入上下文增强和图片到请求中
+    
+    Args:
+        request: 提供商请求对象
+        context_enhancement: 增强的上下文文本
+        image_urls: 图片URL列表
+    """
+    from astrbot.core.agent.message import TextPart, ImageURLPart
+    
+    # 首先处理文本上下文
+    if context_enhancement:
+        # 如果有图片要添加，我们稍后会一起处理
+        # 如果没有图片，直接设置 prompt
+        if not image_urls:
             request.prompt = context_enhancement
             setattr(request, '_context_enhanced', True)
-        if image_urls:
-            if not hasattr(request, 'image_urls') or request.image_urls is None: request.image_urls = []
-            request.image_urls.extend(image_urls)
+    
+    # 处理图片
+    if image_urls and len(image_urls) > 0:
+        try:
+            # 限制图片数量
+            limited_image_urls = image_urls[-self.config.max_images_in_context:] if len(image_urls) > self.config.max_images_in_context else image_urls
+            
+            # 构造 content 列表
+            content_parts = []
+            
+            # 添加文本部分（使用增强后的上下文）
+            text_content = context_enhancement if context_enhancement else request.prompt
+            if text_content:
+                content_parts.append(TextPart(text=text_content))
+            
+            # 添加图片部分 - 使用 Pydantic 模型
+            for img_url in limited_image_urls:
+                if img_url:
+                    try:
+                        # 构造符合 ImageURLPart 的对象
+                        content_parts.append(
+                            ImageURLPart(
+                                image_url=ImageURLPart.ImageURL(url=img_url)
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"[ContextEnhancerV2] 添加图片 {img_url[:50]}... 失败: {e}")
+            
+            # 如果成功添加了内容
+            if content_parts:
+                # 创建一个新的用户消息，包含文本和图片
+                user_message = {
+                    "role": "user",
+                    "content": content_parts
+                }
+                
+                # 将这个消息添加到 contexts 的末尾
+                request.contexts.append(user_message)
+                
+                # 清空 prompt，让系统使用 contexts 中的消息
+                request.prompt = None
+                
+                setattr(request, '_context_enhanced', True)
+                logger.debug(f"[ContextEnhancerV2] 已添加 {len(limited_image_urls)} 张图片和上下文文本到请求中")
+            
+        except Exception as e:
+            logger.error(f"[ContextEnhancerV2] 处理图片时发生错误: {e}")
+            # 出错时回退到只使用文本
+            if context_enhancement:
+                request.prompt = context_enhancement
+                setattr(request, '_context_enhanced', True)
+    elif context_enhancement:
+        # 没有图片时，直接设置 prompt
+        request.prompt = context_enhancement
+        setattr(request, '_context_enhanced', True)
 
     def _find_triggering_message_from_event(self, sorted_messages: list[GroupMessage], llm_request_event: AstrMessageEvent) -> tuple[Optional[GroupMessage], str]:
         nonce = getattr(llm_request_event, '_context_enhancer_nonce', None)
